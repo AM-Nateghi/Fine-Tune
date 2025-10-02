@@ -10,5 +10,8 @@ please ensure about install the follow packages:
 - pandas
 - numpy
 - matplotlib
-
-bash`pip install torch torchvision transformers rouge_score peft datasets pandas numpy matplotlib`
+- rouge_score
+- loralib
+- bitsandbytes
+- scikit-learn
+  bash`pip install torch torchvision transformers rouge_score peft datasets pandas numpy matplotlib loralib bitsandbytes scikit-learn`
