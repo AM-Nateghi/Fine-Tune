@@ -49,10 +49,10 @@ model.gradient_checkpointing_enable(
 
 # ========== تنظیمات LoRA ==========
 lora_conf = LoraConfig(
-    r=16,
-    lora_alpha=16,
+    r=256,
+    lora_alpha=256,
     target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],  # بیشتر ماژول‌ها
-    lora_dropout=0.05,  # کاهش dropout
+    lora_dropout=0.05,
     bias="none",
     task_type=TaskType.CAUSAL_LM,
 )
@@ -68,7 +68,7 @@ dataset = load_dataset(
 # ========== تابع پردازش دیتاست (بهینه‌شده) ==========
 def formatting_func(example):
     """ترکیب input و output به فرمت مناسب"""
-    text = f"{example['input']}{tokenizer.eos_token}{example['output']}{tokenizer.eos_token}"
+    text = f"پرسش: {example['input']}{tokenizer.eos_token}\nپاسخ: {example['output']}{tokenizer.eos_token}"
     return {"text": text}
 
 
@@ -82,7 +82,7 @@ def tokenize_function(examples):
     model_inputs = tokenizer(
         examples["text"],
         truncation=True,
-        max_length=512,
+        max_length=1024,
         padding=False,  # padding را data collator انجام می‌دهد
     )
     # labels برابر با input_ids (برای causal LM)
@@ -161,16 +161,16 @@ trainer = SFTTrainer(
 )
 
 # ========== Training ==========
-print("🚀 شروع Training...")
-print(f"📊 تعداد نمونه‌های Train: {len(dataset['train'])}")
-print(f"📊 تعداد نمونه‌های Test: {len(dataset['test'])}")
+print("🚀 Start Training...")
+print(f"📊 Number of Train samples: {len(dataset['train'])}")
+print(f"📊 Number of Test samples: {len(dataset['test'])}")
 
 torch.cuda.empty_cache()
 trainer.train()
 
 # ========== ذخیره مدل ==========
-print("💾 در حال ذخیره مدل...")
+print("💾 Saving best model...")
 trainer.save_model("./saved_models/gemma_final_model")
 tokenizer.save_pretrained("./saved_models/gemma_final_model")
 
-print("✅ Fine-tuning کامل شد!")
+print("✅ Fine-tuning complete!")
