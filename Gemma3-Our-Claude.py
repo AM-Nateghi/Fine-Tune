@@ -40,6 +40,7 @@ model = AutoModelForCausalLM.from_pretrained(
     quantization_config=bnb_config,
     device_map="auto",
     torch_dtype=torch.bfloat16,
+    # attn_implementation="flash_attention_2",
 )
 model = prepare_model_for_kbit_training(model)
 model.config.use_cache = False
