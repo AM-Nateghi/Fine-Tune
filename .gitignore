@@ -1,3 +1,5 @@
 .env/
 saved_models/*
 gemma_qlora/
+Books/*
+ChunkedBook/*
