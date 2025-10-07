@@ -36,21 +36,21 @@ tokenizer.padding_side = "right"
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
     device_map="auto",
-    torch_dtype=torch.bfloat16,
+    attn_implementation="eager",  # or "flash_attention_2" if available
     trust_remote_code=True,
 )
 
-# # Optional: Use LoRA for efficient fine-tuning
-# lora_config = LoraConfig(
-#     task_type=TaskType.CAUSAL_LM,
-#     r=16,
-#     lora_alpha=32,
-#     lora_dropout=0.05,
-#     target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-#     bias="none",
-# )
-# model = get_peft_model(model, lora_config)
-# model.print_trainable_parameters()
+# Optional: Use LoRA for efficient fine-tuning
+lora_config = LoraConfig(
+    task_type=TaskType.CAUSAL_LM,
+    r=16,
+    lora_alpha=32,
+    lora_dropout=0.05,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    bias="none",
+)
+model = get_peft_model(model, lora_config)
+model.print_trainable_parameters()
 
 # ================================================================
 # Persian Text Normalization
@@ -147,12 +147,12 @@ def filter_by_split(example: Dict[str, Any], split_range: range) -> bool:
     return bucket in split_range
 
 
-# Load dataset
+# Load dataset (NON-STREAMING for proper length calculation)
 raw_dataset = load_dataset(
     "json",
     data_files={"train": DATA_FILE},
-    streaming=True,
-)["train"]
+    split="train",
+)
 
 # Split ranges
 SPLIT_RANGES = {
@@ -168,20 +168,27 @@ def create_phase_dataset(min_score: float):
 
     for split_name, split_range in SPLIT_RANGES.items():
         # Filter by split
-        ds = raw_dataset.filter(lambda ex: filter_by_split(ex, split_range))
+        ds = raw_dataset.filter(
+            lambda ex: filter_by_split(ex, split_range),
+            num_proc=4,  # Parallel processing
+        )
 
         # Preprocess with min_score threshold
         ds = ds.map(
             partial(preprocess_function, min_score=min_score),
             batched=True,
             remove_columns=["question", "response", "score_ratio"],
+            num_proc=4,
         )
 
         # Filter out empty examples
-        ds = ds.filter(lambda ex: len(ex.get("input_ids", [])) > 0)
+        ds = ds.filter(
+            lambda ex: len(ex.get("input_ids", [])) > 0,
+            num_proc=4,
+        )
 
         if split_name == "train":
-            ds = ds.shuffle(buffer_size=10000, seed=42)
+            ds = ds.shuffle(seed=42)
 
         datasets[split_name] = ds
 
@@ -189,10 +196,16 @@ def create_phase_dataset(min_score: float):
 
 
 # Phase 1: High-quality examples (score >= 0.8)
+print("Creating Phase 1 datasets...")
 phase1_datasets = create_phase_dataset(min_score=0.8)
+print(f"Phase 1 - Train: {len(phase1_datasets['train'])} examples")
+print(f"Phase 1 - Val: {len(phase1_datasets['validation'])} examples")
 
 # Phase 2: Medium-quality examples (score >= 0.7)
+print("\nCreating Phase 2 datasets...")
 phase2_datasets = create_phase_dataset(min_score=0.7)
+print(f"Phase 2 - Train: {len(phase2_datasets['train'])} examples")
+print(f"Phase 2 - Val: {len(phase2_datasets['validation'])} examples")
 
 # ================================================================
 # Data Collator (using built-in HuggingFace collator)
@@ -323,7 +336,7 @@ print("INFERENCE TEST")
 print("=" * 60)
 
 model.eval()
-test_question = "چرا خواب های ما وجود دارند و واقعی هستند؟"
+test_question = "چرا خواب های ما واقعی هستند؟"
 prompt = f"سوال: {test_question}\nپاسخ:"
 
 inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
