@@ -1,26 +1,26 @@
 import os
-import math
-import torch
-import random
 import hashlib
-from typing import Dict, List, Iterable, Iterator, Any
+import torch
+from typing import Dict, Any
+from functools import partial
 
 import huggingface_hub
-from datasets import load_dataset, IterableDatasetDict, IterableDataset
+from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     TrainingArguments,
     Trainer,
+    DataCollatorForLanguageModeling,
     EarlyStoppingCallback,
-    get_cosine_schedule_with_warmup,
 )
+from peft import LoraConfig, get_peft_model, TaskType
 
 # ================================================================
-# Enviroment & Login into HuggingFace
+# Environment & Login
 # ================================================================
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-hf_token = ""  # if you need to login
+hf_token = ""
 if hf_token:
     huggingface_hub.login(token=hf_token)
     print(f"Welcome {huggingface_hub.whoami()['name']}!")
@@ -28,29 +28,34 @@ if hf_token:
 # ================================================================
 # Model & Tokenizer
 # ================================================================
-cptk = "google/gemma-3-270m"
-tokenizer = AutoTokenizer.from_pretrained(cptk)
+MODEL_NAME = "google/gemma-3-270m"
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "right"
 
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-
 model = AutoModelForCausalLM.from_pretrained(
-    cptk, device_map="auto", torch_dtype=torch.bfloat16
-)
-model.config.use_cache = False
-model.gradient_checkpointing_enable(
-    gradient_checkpointing_kwargs={"use_reentrant": False}
+    MODEL_NAME,
+    device_map="auto",
+    torch_dtype=torch.bfloat16,
+    trust_remote_code=True,
 )
 
+# # Optional: Use LoRA for efficient fine-tuning
+# lora_config = LoraConfig(
+#     task_type=TaskType.CAUSAL_LM,
+#     r=16,
+#     lora_alpha=32,
+#     lora_dropout=0.05,
+#     target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+#     bias="none",
+# )
+# model = get_peft_model(model, lora_config)
+# model.print_trainable_parameters()
+
 # ================================================================
-# Normalization utilities for Persian text
+# Persian Text Normalization
 # ================================================================
-ARABIC_TO_PERSIAN = {
-    "\u064a": "ی",  # ي -> ی
-    "\u0643": "ک",  # ك -> ک
-    "\u06cc": "ی",  # ی -> ی (یکنواخت‌سازی)
-}
+ARABIC_TO_PERSIAN = {"\u064a": "ی", "\u0643": "ک", "\u06cc": "ی"}
 PERSIAN_DIGITS_TO_EN = {
     "۰": "0",
     "۱": "1",
@@ -68,310 +73,270 @@ PERSIAN_DIGITS_TO_EN = {
 def normalize_text(text: str) -> str:
     if not isinstance(text, str):
         return ""
-    # Arabic -> Persian letters
-    out = "".join(ARABIC_TO_PERSIAN.get(chunk, chunk) for chunk in text)
+    # Arabic -> Persian
+    for ar, fa in ARABIC_TO_PERSIAN.items():
+        text = text.replace(ar, fa)
     # Persian digits -> English
-    out = "".join(PERSIAN_DIGITS_TO_EN.get(ch, ch) for ch in out)
-    # Normalize spaces and punctuation spacing
-    out = out.replace("\u200c", "\u200c")  # keep ZWNJ as-is, but you could refine rules
-    # Trim redundant spaces
-    out = " ".join(out.split())
-    # Fix common punctuation spacing: remove space before ?, add space after ,
-    out = out.replace(" ؟", "؟").replace("،", "، ").replace(" ?", "?")
-    out = " ".join(out.split())  # re-trim
-    return out
-
-
-def valid_example(ex):
-    return (
-        isinstance(ex, dict)
-        and "question" in ex
-        and "response" in ex
-        and "score_ratio" in ex
-    )
+    for fa, en in PERSIAN_DIGITS_TO_EN.items():
+        text = text.replace(fa, en)
+    # Clean spacing
+    text = " ".join(text.split())
+    text = text.replace(" ؟", "؟").replace("،", "، ").replace(" ?", "?")
+    return " ".join(text.split())
 
 
 # ================================================================
-# Streaming dataset with split via deterministic hashing
+# Dataset Loading & Preprocessing
 # ================================================================
-DATA_FILE = "assets/dataset_output.filtered.jsonl"  # JSONL with keys: question, response, score_ratio
-
-raw_stream = load_dataset("json", data_files={"all": DATA_FILE}, streaming=True)["all"]
+DATA_FILE = "assets/dataset_output.filtered.jsonl"
 
 
 def split_key(question: str) -> int:
-    # Deterministic split based on SHA1 hash of question
-    h = hashlib.sha1((question or "").encode("utf-8")).hexdigest()
-    return int(h[:6], 16) % 100  # 0,1,...,99
+    """Deterministic hash-based splitting"""
+    h = hashlib.sha1(question.encode("utf-8")).hexdigest()
+    return int(h[:6], 16) % 100
 
 
-def filter_stream(
-    stream: Iterable[Dict[str, Any]], min_score: float, split_ranges: Dict[str, range]
-) -> IterableDatasetDict:
-    def gen_for_split(target_split: str) -> Iterator[Dict[str, Any]]:
-        r = split_ranges[target_split]
-        for ex in stream:
-            q = ex.get("question", "")
-            a = ex.get("response", "")
-            s = ex.get("score_ratio", None)
+def preprocess_function(
+    examples: Dict[str, list], min_score: float = 0.0
+) -> Dict[str, list]:
+    """Tokenize and format examples"""
+    texts = []
 
-            if not isinstance(q, str) or not isinstance(a, str) or s is None:
+    for q, a, s in zip(
+        examples["question"], examples["response"], examples["score_ratio"]
+    ):
+        # Validate and normalize
+        if not isinstance(q, str) or not isinstance(a, str):
+            texts.append("")
+            continue
+
+        try:
+            score = float(s)
+            if score < min_score or score < 0.0 or score > 1.0:
+                texts.append("")
                 continue
+        except:
+            texts.append("")
+            continue
 
-            # Normalize
-            q_norm = normalize_text(q)
-            a_norm = normalize_text(a)
+        q_norm = normalize_text(q)
+        a_norm = normalize_text(a)
 
-            # Enforce score bounds and curriculum filter
-            try:
-                s_float = float(s)
-            except:
-                continue
-            if s_float < 0.0 or s_float > 1.0:
-                continue
-            if s_float < min_score:
-                continue
+        # Format as instruction-response pair
+        text = f"سوال: {q_norm}\nپاسخ: {a_norm}"
+        texts.append(text)
 
-            # split routing
-            bucket = split_key(q_norm)
-            if bucket in r:
-                yield {
-                    "question": q_norm,
-                    "response": a_norm,
-                    "score_ratio": s_float,
-                }
+    # Tokenize
+    tokenized = tokenizer(
+        texts,
+        truncation=True,
+        max_length=1024,
+        padding=False,  # Dynamic padding in collator
+    )
 
-    datasets = {}
-    for name in split_ranges.keys():
-        datasets[name] = IterableDataset.from_generator(lambda n=name: gen_for_split(n))
-    return IterableDatasetDict(datasets)
+    return tokenized
 
 
-# Define split ranges: 95/2/3
-split_ranges = {
+def filter_by_split(example: Dict[str, Any], split_range: range) -> bool:
+    """Filter examples by split using hash"""
+    q = example.get("question", "")
+    if not isinstance(q, str):
+        return False
+    bucket = split_key(normalize_text(q))
+    return bucket in split_range
+
+
+# Load dataset
+raw_dataset = load_dataset(
+    "json",
+    data_files={"train": DATA_FILE},
+    streaming=True,
+)["train"]
+
+# Split ranges
+SPLIT_RANGES = {
     "train": range(0, 95),
     "validation": range(95, 97),
     "test": range(97, 100),
 }
 
-# Curriculum phase 1: min_score = 0.8
-stream_phase1 = filter_stream(raw_stream, min_score=0.8, split_ranges=split_ranges)
-stream_phase1["train"] = stream_phase1["train"].filter(valid_example)
-# Phase 2: min_score = 0.7
-stream_phase2 = filter_stream(raw_stream, min_score=0.7, split_ranges=split_ranges)
-stream_phase2["train"] = stream_phase2["train"].filter(valid_example)
 
-# Optional shuffle buffers for streaming
-stream_phase1["train"] = stream_phase1["train"].shuffle(buffer_size=1e4)
-stream_phase2["train"] = stream_phase2["train"].shuffle(buffer_size=1e4)
+def create_phase_dataset(min_score: float):
+    """Create train/val/test splits for a curriculum phase"""
+    datasets = {}
 
+    for split_name, split_range in SPLIT_RANGES.items():
+        # Filter by split
+        ds = raw_dataset.filter(lambda ex: filter_by_split(ex, split_range))
 
-# ================================================================
-# Custom Data Collator with dynamic padding and label masking
-# ================================================================
-class QADataCollator:
-    def __init__(self, tokenizer: AutoTokenizer, max_length: int = 1024):
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        input_ids_batch = []
-        attention_mask_batch = []
-        labels_batch = []
-        weights_batch = []
-
-        for ex in features:
-            if "question" not in ex or "response" not in ex:
-                print(f"Malformed example: {ex}")
-                continue
-            question = ex["question"]
-            answer = ex["response"]
-            score = float(ex.get("score_ratio", 1.0))
-            # Clamp score ratio to [0,1]
-            score = max(0.0, min(1.0, score))
-
-            # Build prompt: "سوال: ... \nپاسخ:"
-            prompt = f"سوال: {question}\nپاسخ:"
-            tok_prompt = self.tokenizer(
-                prompt,
-                add_special_tokens=True,
-                truncation=True,
-                max_length=self.max_length,
-            )
-            tok_answer = self.tokenizer(
-                answer + self.tokenizer.eos_token,
-                add_special_tokens=False,
-                truncation=True,
-                max_length=self.max_length,
-            )
-
-            # Compos sequence: [prompt]+[answer]
-            input_ids = tok_prompt["input_ids"] + tok_answer["input_ids"]
-            attention_mask = [1] * len(input_ids)
-
-            # Truncate to max_length from the end
-            if len(input_ids) > self.max_length:
-                input_ids = input_ids[:, self.max_length]
-                attention_mask = attention_mask[:, self.max_length]
-
-            # Labels: mask prompt tokens as -100 train only on answer tokens
-            # Number of prompt tokens that survived truncation:
-            prompt_len = min(len(tok_prompt["input_ids"], len(input_ids)))
-            labels = [-100] * prompt_len + input_ids[prompt_len:]
-
-            # Dynamic padding to the longest in batch will be applied by padding in Trainer;
-            # but we can do manual right-padding to max in-batch length if needed.
-            input_ids_batch.append(torch.tensor(input_ids, dtype=torch.long))
-            attention_mask_batch.append(torch.tensor(attention_mask, dtype=torch.long))
-            labels_batch.append(torch.tensor(labels, dtype=torch.long))
-            weights_batch.append(torch.tensor(score, dtype=torch.bfloat16))
-
-        if not weights_batch:
-            raise ValueError("Batch with only malformed examples encountered!")
-
-        # Pad to longest length in batch (dynamic padding)
-        batch = self.tokenizer.pad(
-            {
-                "input_ids": input_ids_batch,
-                "attention_mask": attention_mask_batch,
-                "labels": labels_batch,
-            },
-            padding=True,
-            return_tensors="pt",
-        )
-        # Attach weights (no padding needed; one weight per example)
-        batch["weights"] = torch.stack(weights_batch)
-        return batch
-
-
-collator = QADataCollator(tokenizer, max_length=1024)
-
-
-# ================================================================
-# Custom Trainer to apply per-example weights in loss
-# ================================================================
-class WeightedLossTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False):
-        labels = inputs.get("labels")
-        weights = inputs.get("weights")
-        outputs = model(**{k: v for k, v in inputs.items() if k not in ["weights"]})
-        logits = outputs.get("logits")
-
-        # Shift for causal LM loss
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
-
-        loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
-        # (batch, seq)
-        per_token_loss = loss_fct(
-            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-        )
-        per_token_loss = per_token_loss.view(shift_labels.size(0), shift_labels.size(1))
-
-        # Mask valid tokens
-        mask = (shift_labels != -100).to(per_token_loss.dtype)
-        per_example_loss = (per_token_loss * mask).sum(dim=1) / (
-            mask.sum(dim=1).clamp(min=1)
+        # Preprocess with min_score threshold
+        ds = ds.map(
+            partial(preprocess_function, min_score=min_score),
+            batched=True,
+            remove_columns=["question", "response", "score_ratio"],
         )
 
-        if weights is not None:
-            # Scale loss per example by score_ratio (already clamped 0..1)
-            per_example_loss = per_example_loss * weights.to(per_example_loss.dtype)
+        # Filter out empty examples
+        ds = ds.filter(lambda ex: len(ex.get("input_ids", [])) > 0)
 
-        loss = per_example_loss.mean()
-        return (loss, outputs) if return_outputs else loss
+        if split_name == "train":
+            ds = ds.shuffle(buffer_size=10000, seed=42)
+
+        datasets[split_name] = ds
+
+    return datasets
+
+
+# Phase 1: High-quality examples (score >= 0.8)
+phase1_datasets = create_phase_dataset(min_score=0.8)
+
+# Phase 2: Medium-quality examples (score >= 0.7)
+phase2_datasets = create_phase_dataset(min_score=0.7)
+
+# ================================================================
+# Data Collator (using built-in HuggingFace collator)
+# ================================================================
+data_collator = DataCollatorForLanguageModeling(
+    tokenizer=tokenizer,
+    mlm=False,  # Causal LM, not masked LM
+)
 
 
 # ================================================================
-# Training arguments
+# Training Arguments
 # ================================================================
-def make_args(output_dir: str, max_steps: int = 5000):
+def get_training_args(output_dir: str, num_train_epochs: int = 3):
     return TrainingArguments(
         output_dir=output_dir,
-        max_steps=max_steps,
-        per_device_train_batch_size=2,
-        per_device_eval_batch_size=2,
-        gradient_accumulation_steps=8,  # effective batch size ~16
-        bf16=True,  # compute bf16
-        fp16=False,
-        gradient_checkpointing=True,
-        max_grad_norm=1.0,
+        num_train_epochs=num_train_epochs,
+        per_device_train_batch_size=4,
+        per_device_eval_batch_size=4,
+        gradient_accumulation_steps=4,  # Effective batch size = 16
+        # Optimization
+        learning_rate=2e-4,
         weight_decay=0.01,
-        learning_rate=1e-4,
+        max_grad_norm=1.0,
         lr_scheduler_type="cosine",
-        warmup_ratio=0.05,  # ~5% warmup
+        warmup_ratio=0.1,
+        # Mixed precision
+        bf16=True,
+        bf16_full_eval=True,
+        # Logging & Checkpointing
         logging_steps=50,
         eval_strategy="steps",
-        eval_steps=800,
+        eval_steps=500,
         save_strategy="steps",
-        save_steps=800,
-        save_total_limit=3,
+        save_steps=500,
+        save_total_limit=2,
+        # Best model tracking
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        report_to=["none"],
-        dataloader_num_workers=0,
+        # Misc
+        report_to=["tensorboard"],
+        dataloader_num_workers=2,
         dataloader_pin_memory=True,
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        # Disable cache for training
+        use_cpu=False,
     )
 
 
 # ================================================================
-# Build Dataloaders (streaming) for each phase
+# Phase 1 Training (High-quality data)
 # ================================================================
-def make_phase_datasets(stream_dict: IterableDatasetDict):
-    return {
-        "train": stream_dict["train"],
-        "eval": stream_dict["validation"],
-        "test": stream_dict["test"],
-    }
+print("\n" + "=" * 60)
+print("PHASE 1: Training on high-quality examples (score >= 0.8)")
+print("=" * 60)
 
+args_phase1 = get_training_args(
+    output_dir="./outputs/gemma3_phase1",
+    num_train_epochs=2,
+)
 
-phase1_data = make_phase_datasets(stream_phase1)
-phase2_data = make_phase_datasets(stream_phase2)
-
-
-# ================================================================
-# Train: Curriculum Phase 1 (score_ratio >= 0.8)
-# ================================================================
-args_phase1 = make_args(output_dir="./assets/gemma3.270m.phase1", max_steps=5000)
-
-trainer_phase1 = WeightedLossTrainer(
+trainer_phase1 = Trainer(
     model=model,
     args=args_phase1,
-    train_dataset=phase1_data["train"],
-    eval_dataset=phase1_data["eval"],
-    data_collator=collator,
-    tokenizer=tokenizer,
+    train_dataset=phase1_datasets["train"],
+    eval_dataset=phase1_datasets["validation"],
+    data_collator=data_collator,
     callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
 )
 
-train_result_1 = trainer_phase1.train()
-trainer_phase1.save_model()  # saves to output_dir
-
-# Optionally evaluate phase 1
-eval_result_1 = trainer_phase1.evaluate()
+trainer_phase1.train()
+trainer_phase1.save_model()
+eval_results_1 = trainer_phase1.evaluate()
+print(f"Phase 1 Eval Loss: {eval_results_1['eval_loss']:.4f}")
 
 # ================================================================
-# Train: Main Phase 2 (score_ratio >= 0.7), continue from phase1
+# Phase 2 Training (Medium-quality data)
 # ================================================================
-args_phase2 = make_args(output_dir="./assets/gemma3.270m.phase2", max_steps=5000)
+print("\n" + "=" * 60)
+print("PHASE 2: Training on medium-quality examples (score >= 0.7)")
+print("=" * 60)
 
-trainer_phase2 = WeightedLossTrainer(
-    model=trainer_phase1,  # continue training same model
+args_phase2 = get_training_args(
+    output_dir="./outputs/gemma3_phase2",
+    num_train_epochs=3,
+)
+
+trainer_phase2 = Trainer(
+    model=model,  # Continue from phase 1
     args=args_phase2,
-    train_dataset=phase2_data["train"],
-    eval_dataset=phase2_data["eval"],
-    data_collator=collator,
-    tokenizer=tokenizer,
+    train_dataset=phase2_datasets["train"],
+    eval_dataset=phase2_datasets["validation"],
+    data_collator=data_collator,
     callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
 )
 
-train_result_2 = trainer_phase2.train()
+trainer_phase2.train()
 trainer_phase2.save_model()
-eval_result_2 = trainer_phase2.evaluate()
+eval_results_2 = trainer_phase2.evaluate()
+print(f"Phase 2 Eval Loss: {eval_results_2['eval_loss']:.4f}")
 
 # ================================================================
-# Final test evaluation (optional)
+# Final Test Evaluation
 # ================================================================
-test_metrics = trainer_phase2.evaluate(eval_dataset=phase2_data["test"])
-print("Test metrics:", test_metrics)
+print("\n" + "=" * 60)
+print("FINAL TEST EVALUATION")
+print("=" * 60)
+
+test_results = trainer_phase2.evaluate(eval_dataset=phase2_datasets["test"])
+print(f"Test Loss: {test_results['eval_loss']:.4f}")
+print(f"Test Perplexity: {torch.exp(torch.tensor(test_results['eval_loss'])):.4f}")
+
+# ================================================================
+# Save Final Model
+# ================================================================
+final_model_path = "./outputs/gemma3_final"
+model.save_pretrained(final_model_path)
+tokenizer.save_pretrained(final_model_path)
+print(f"\nFinal model saved to: {final_model_path}")
+
+# ================================================================
+# Inference Example
+# ================================================================
+print("\n" + "=" * 60)
+print("INFERENCE TEST")
+print("=" * 60)
+
+model.eval()
+test_question = "چرا خواب های ما وجود دارند و واقعی هستند؟"
+prompt = f"سوال: {test_question}\nپاسخ:"
+
+inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+with torch.no_grad():
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=100,
+        temperature=0.7,
+        top_p=0.9,
+        do_sample=True,
+        pad_token_id=tokenizer.pad_token_id,
+    )
+
+response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+print(f"Question: {test_question}")
+print(f"Response: {response}")
