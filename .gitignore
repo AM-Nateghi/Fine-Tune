@@ -3,3 +3,4 @@ saved_models/*
 gemma_qlora/
 Books/*
 ChunkedBook/*
+assets/dataset_output.jsonl
