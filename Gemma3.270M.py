@@ -82,6 +82,15 @@ def normalize_text(text: str) -> str:
     return out
 
 
+def valid_example(ex):
+    return (
+        isinstance(ex, dict)
+        and "question" in ex
+        and "response" in ex
+        and "score_ratio" in ex
+    )
+
+
 # ================================================================
 # Streaming dataset with split via deterministic hashing
 # ================================================================
@@ -147,8 +156,10 @@ split_ranges = {
 
 # Curriculum phase 1: min_score = 0.8
 stream_phase1 = filter_stream(raw_stream, min_score=0.8, split_ranges=split_ranges)
+stream_phase1["train"] = stream_phase1["train"].filter(valid_example)
 # Phase 2: min_score = 0.7
 stream_phase2 = filter_stream(raw_stream, min_score=0.7, split_ranges=split_ranges)
+stream_phase2["train"] = stream_phase2["train"].filter(valid_example)
 
 # Optional shuffle buffers for streaming
 stream_phase1["train"] = stream_phase1["train"].shuffle(buffer_size=1e4)
