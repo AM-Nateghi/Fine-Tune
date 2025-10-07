@@ -85,9 +85,7 @@ def normalize_text(text: str) -> str:
 # ================================================================
 # Streaming dataset with split via deterministic hashing
 # ================================================================
-DATA_FILE = DATA_FILE = (
-    "./assets/dataset_output.jsonl"  # JSONL with keys: question, response, score_ratio
-)
+DATA_FILE = "assets/dataset_output.filtered.jsonl"  # JSONL with keys: question, response, score_ratio
 
 raw_stream = load_dataset("json", data_files={"all": DATA_FILE}, streaming=True)["all"]
 
@@ -172,6 +170,9 @@ class QADataCollator:
         weights_batch = []
 
         for ex in features:
+            if "question" not in ex or "response" not in ex:
+                print(f"Malformed example: {ex}")
+                continue
             question = ex["question"]
             answer = ex["response"]
             score = float(ex.get("score_ratio", 1.0))
@@ -213,6 +214,9 @@ class QADataCollator:
             attention_mask_batch.append(torch.tensor(attention_mask, dtype=torch.long))
             labels_batch.append(torch.tensor(labels, dtype=torch.long))
             weights_batch.append(torch.tensor(score, dtype=torch.bfloat16))
+
+        if not weights_batch:
+            raise ValueError("Batch with only malformed examples encountered!")
 
         # Pad to longest length in batch (dynamic padding)
         batch = self.tokenizer.pad(
@@ -295,7 +299,7 @@ def make_args(output_dir: str, max_steps: int = 5000):
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         report_to=["none"],
-        dataloader_num_workers=4,
+        dataloader_num_workers=0,
         dataloader_pin_memory=True,
     )
 
