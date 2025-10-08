@@ -5,3 +5,4 @@ Books/*
 ChunkedBook/*
 assets/dataset_output.jsonl
 assets/dataset_output.filtered.jsonl
+outputs/*
