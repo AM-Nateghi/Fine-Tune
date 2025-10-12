@@ -4,5 +4,6 @@ gemma_qlora/
 Books/*
 ChunkedBook/*
 assets/dataset_output.jsonl
+assets/merged_dataset.jsonl
 assets/dataset_output.filtered.jsonl
 outputs/*
