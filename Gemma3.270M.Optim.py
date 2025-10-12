@@ -1,13 +1,13 @@
 import os
 import hashlib
 import torch
-from typing import Dict, Any, List
+from typing import Dict, Any
 from functools import partial
 import json
 from pathlib import Path
 
 import huggingface_hub
-from datasets import Dataset
+from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -28,21 +28,20 @@ class Config:
     MODEL_NAME = "google/gemma-3-270m"
     USE_QLORA = True
 
-    # 🔥 DATA SAMPLING - برای تست
-    SAMPLE_RATIO = 0.01  # 1% از 303 سوال = ~3 سوال
-    # برای production بزن 1.0
-
-    # Data - ساختار جدید
-    DATA_FILE = "assets/dataset_output.json"  # فایل JSON با ساختار جدید
+    # 🔥 DATA - فایل flatten شده
+    SFT_DATA_FILE = "assets/flattened/sft_dataset.jsonl"
     MAX_LENGTH = 512
 
-    # 🔥 استراتژی استفاده از پاسخ‌ها
-    USE_NEGATIVE_SAMPLES = True  # آیا پاسخ‌های بد هم استفاده بشه؟
-    MAX_RESPONSES_PER_QUESTION = 50  # حداکثر پاسخ برای هر سوال (برای بالانس)
+    # 🔥 Sampling
+    SAMPLE_RATIO = 0.01  # برای تست - 1% دیتا
+    # برای production: 1.0
+
+    # 🔥 Weighted Training
+    USE_SAMPLE_WEIGHTS = True  # استفاده از weight های محاسبه شده
 
     # QLoRA
-    LORA_R = 256
-    LORA_ALPHA = 512
+    LORA_R = 64
+    LORA_ALPHA = 128
     LORA_DROPOUT = 0.03
     LORA_TARGET_MODULES = [
         "q_proj",
@@ -65,6 +64,10 @@ class Config:
     CURRICULUM_PHASES = [
         {"name": "test_phase", "min_score": 0.8, "epochs": 2, "lr": 2e-4},
     ]
+    # Production:
+    # {"name": "warmup", "min_score": 0.95, "epochs": 1, "lr": 5e-5},
+    # {"name": "main", "min_score": 0.85, "epochs": 2, "lr": 2e-4},
+    # {"name": "finetune", "min_score": 0.8, "epochs": 2, "lr": 1e-4},
 
     # Training
     BATCH_SIZE = 4
@@ -81,8 +84,8 @@ class Config:
     RESUME_FROM_CHECKPOINT = True
 
     # Output
-    OUTPUT_DIR = "./outputs/gemma3_new"
-    BACKUP_DIR = "./outputs/gemma3_new/backups"
+    OUTPUT_DIR = "./outputs/gemma3_weighted"
+    BACKUP_DIR = "./outputs/gemma3_weighted/backups"
 
 
 config = Config()
@@ -101,6 +104,12 @@ if hf_token:
 # Safety Checkpoint Manager
 # ================================================================
 class SafeCheckpointCallback(TrainerCallback):
+    """
+    Callback برای:
+    1. Backup کردن بهترین checkpoint
+    2. لاگ کردن دقیق metrics
+    """
+
     def __init__(self, backup_dir: str):
         self.backup_dir = Path(backup_dir)
         self.backup_dir.mkdir(parents=True, exist_ok=True)
@@ -111,6 +120,7 @@ class SafeCheckpointCallback(TrainerCallback):
         if metrics and "eval_loss" in metrics:
             loss = metrics["eval_loss"]
 
+            # لاگ کردن metrics
             log_entry = {
                 "step": state.global_step,
                 "epoch": state.epoch,
@@ -127,11 +137,13 @@ class SafeCheckpointCallback(TrainerCallback):
             with open(self.log_file, "a") as f:
                 f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
 
+            # Backup بهترین مدل
             if loss < self.best_loss:
                 self.best_loss = loss
                 backup_path = self.backup_dir / f"best_model_step{state.global_step}"
                 print(f"\n💾 NEW BEST! Backing up to {backup_path}")
 
+                # حذف backup های قدیمی
                 for old_backup in self.backup_dir.glob("best_model_step*"):
                     if old_backup != backup_path:
                         import shutil
@@ -140,9 +152,62 @@ class SafeCheckpointCallback(TrainerCallback):
 
 
 # ================================================================
+# 🔥 Custom Weighted Trainer
+# ================================================================
+class WeightedTrainer(Trainer):
+    """
+    Trainer با پشتیبانی از sample weights
+
+    این Trainer می‌تونه به هر sample یک وزن اختصاص بده.
+    مثلا: سوالاتی که کمتر پاسخ دارن، وزن بیشتری می‌گیرن
+    """
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """
+        Override loss برای اعمال weights
+
+        نحوه کار:
+        1. weights رو از inputs استخراج می‌کنیم
+        2. Forward pass معمولی
+        3. Loss رو با weights ضرب می‌کنیم
+        """
+
+        # استخراج weights از inputs
+        weights = inputs.pop("weights", None)
+
+        # Forward pass
+        outputs = model(**inputs)
+
+        # محاسبه loss
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
+
+        loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+        # اعمال weights
+        if weights is not None and config.USE_SAMPLE_WEIGHTS:
+            # weights shape: (batch_size,)
+            # میانگین weights batch رو می‌گیریم و به loss اعمال می‌کنیم
+            weight_avg = weights.mean()
+            loss = loss * weight_avg
+
+        return (loss, outputs) if return_outputs else loss
+
+
+# ================================================================
 # Quantization
 # ================================================================
 def get_bnb_config():
+    """
+    تنظیمات 4-bit quantization برای QLoRA
+
+    چرا quantization؟
+    - کاهش حافظه VRAM (از 24GB به 12GB)
+    - سرعت بیشتر
+    - دقت تقریباً یکسان
+
+    نوع: NF4 (NormalFloat4) - بهترین برای LLM ها
+    """
     if not config.USE_QLORA:
         return None
     return BitsAndBytesConfig(
@@ -206,6 +271,7 @@ PERSIAN_DIGITS_TO_EN = {f"۰۱۲۳۴۵۶۷۸۹"[i]: str(i) for i in range(10)}
 
 
 def normalize_text(text: str) -> str:
+    """نرمال‌سازی متن فارسی"""
     if not isinstance(text, str):
         return ""
     for ar, fa in ARABIC_TO_PERSIAN.items():
@@ -218,173 +284,121 @@ def normalize_text(text: str) -> str:
 
 
 # ================================================================
-# 🔥 NEW: Dataset Processing با ساختار جدید
+# Dataset Processing
 # ================================================================
 def split_key(text: str) -> int:
-    """برای split کردن train/val/test"""
+    """
+    برای split کردن train/val/test به صورت deterministic
+
+    از hash استفاده می‌کنیم تا همیشه یک سوال توی همون split بمونه
+    """
     h = hashlib.sha1(text.encode("utf-8")).hexdigest()
     return int(h[:6], 16) % 100
 
 
-def load_new_structure_data(min_score: float) -> List[Dict[str, Any]]:
-    """
-    خواندن دیتا با ساختار جدید:
-    [
-        {
-            "question_id": "...",
-            "best_response": "...",
-            "positive_responses": [{"text": "...", "score_ratio": 1.0}, ...],
-            "negative_responses": [{"text": "...", "score_ratio": 0.0}, ...],
-            "questions": ["سوال اصلی", "variant 1", ...]
-        },
-        ...
-    ]
-    """
-    print(f"\n📂 Loading data from {config.DATA_FILE}")
-    with open(config.DATA_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    # Sampling برای تست
-    if config.SAMPLE_RATIO < 1.0:
-        n_samples = int(len(data) * config.SAMPLE_RATIO)
-        import random
-
-        random.seed(42)
-        data = random.sample(data, n_samples)
-        print(f"   📊 Sampled: {len(data)} questions")
-
-    # تبدیل به فرمت flat برای training
-    examples = []
-    stats = {"total_pairs": 0, "positive_pairs": 0, "negative_pairs": 0, "skipped": 0}
-
-    for item in data:
-        question_variants = item.get("questions", [])
-        if not question_variants:
-            stats["skipped"] += 1
-            continue
-
-        # انتخاب سوال اصلی (اولین variant)
-        main_question = question_variants[0]
-
-        # پاسخ‌های مثبت
-        positive_responses = item.get("positive_responses", [])
-        # محدود کردن تعداد پاسخ‌ها
-        if len(positive_responses) > config.MAX_RESPONSES_PER_QUESTION:
-            import random
-
-            positive_responses = random.sample(
-                positive_responses, config.MAX_RESPONSES_PER_QUESTION
-            )
-
-        for resp in positive_responses:
-            if resp.get("score_ratio", 0) >= min_score:
-                examples.append(
-                    {
-                        "question": main_question,
-                        "response": resp["text"],
-                        "score_ratio": resp["score_ratio"],
-                        "label": "positive",
-                    }
-                )
-                stats["positive_pairs"] += 1
-
-        # پاسخ‌های منفی (اختیاری)
-        if config.USE_NEGATIVE_SAMPLES:
-            negative_responses = item.get("negative_responses", [])
-            # تعداد کمتری از negative samples
-            max_neg = min(len(negative_responses), len(positive_responses) // 2)
-            if len(negative_responses) > max_neg:
-                import random
-
-                negative_responses = random.sample(negative_responses, max_neg)
-
-            for resp in negative_responses[:max_neg]:
-                examples.append(
-                    {
-                        "question": main_question,
-                        "response": resp["text"],
-                        "score_ratio": resp.get("score_ratio", 0.0),
-                        "label": "negative",
-                    }
-                )
-                stats["negative_pairs"] += 1
-
-        stats["total_pairs"] = stats["positive_pairs"] + stats["negative_pairs"]
-
-    print(f"\n📊 Data Statistics:")
-    print(f"   Total Q-A pairs: {stats['total_pairs']:,}")
-    print(f"   Positive pairs: {stats['positive_pairs']:,}")
-    print(f"   Negative pairs: {stats['negative_pairs']:,}")
-    print(f"   Skipped questions: {stats['skipped']}")
-
-    return examples
-
-
 def preprocess_function(examples: Dict[str, list]):
-    """Tokenization برای ساختار جدید"""
+    """
+    Tokenization برای flattened data
+
+    Input format:
+    {
+        "question": "...",
+        "response": "...",
+        "score": 1.0,
+        "weight": 0.5
+    }
+
+    Output: tokenized text + weights
+    """
     texts = []
-    for q, a, label in zip(
-        examples["question"], examples["response"], examples["label"]
+    weights = []
+
+    for q, r, score, weight in zip(
+        examples["question"],
+        examples["response"],
+        examples["score"],
+        examples["weight"],
     ):
-        if not (isinstance(q, str) and isinstance(a, str)):
+        if not (isinstance(q, str) and isinstance(r, str)):
             texts.append("")
+            weights.append(1.0)
             continue
 
         q_norm = normalize_text(q)
-        a_norm = normalize_text(a)
+        r_norm = normalize_text(r)
 
-        # 🔥 برای negative samples می‌تونی prefix اضافه کنی (اختیاری)
-        if label == "negative":
-            # اگر می‌خوای مدل یاد بگیره چی بد هست:
-            # text = f"سوال: {q_norm}\nپاسخ نادرست: {a_norm}"
-            # ولی معمولا negative samples رو نمی‌زاریم توی causal LM
-            texts.append("")  # Skip negative samples in training
-            continue
-
-        text = f"سوال: {q_norm}\nپاسخ: {a_norm}"
+        text = f"سوال: {q_norm}\nپاسخ: {r_norm}"
         texts.append(text)
+        weights.append(float(weight))
 
-    return tokenizer(
+    tokenized = tokenizer(
         texts,
         truncation=True,
         max_length=config.MAX_LENGTH,
         padding=False,
     )
 
+    # اضافه کردن weights به output
+    tokenized["weights"] = weights
+
+    return tokenized
+
 
 SPLIT_RANGES = {
-    "train": range(0, 95),
-    "validation": range(95, 97),
-    "test": range(97, 100),
+    "train": range(0, 95),  # 95% train
+    "validation": range(95, 97),  # 2% validation
+    "test": range(97, 100),  # 3% test
 }
 
 
 def create_curriculum_dataset(min_score: float):
-    """ساخت dataset با split های train/val/test"""
-    print(f"\n📚 Creating curriculum dataset (min_score={min_score})")
+    """
+    Load و split کردن flattened dataset
 
-    # Load data
-    raw_examples = load_new_structure_data(min_score)
+    مراحل:
+    1. Load کردن JSONL
+    2. Sampling (اگه لازم باشه)
+    3. فیلتر براساس score
+    4. Split به train/val/test
+    5. Tokenization
+    """
+    print(f"\n📚 Loading flattened dataset (min_score={min_score})")
+    print(f"   File: {config.SFT_DATA_FILE}")
+
+    # Load dataset
+    raw = load_dataset(
+        "json", data_files={"train": config.SFT_DATA_FILE}, split="train"
+    )
+
+    print(f"   Total samples: {len(raw):,}")
+
+    # 🔥 Sampling برای تست
+    if config.SAMPLE_RATIO < 1.0:
+        n_samples = int(len(raw) * config.SAMPLE_RATIO)
+        raw = raw.shuffle(seed=42).select(range(n_samples))
+        print(f"   Sampled: {len(raw):,} examples")
+
+    # فیلتر براساس score
+    raw = raw.filter(lambda ex: ex.get("score", 0) >= min_score, num_proc=4)
+    print(f"   After score filter (>={min_score}): {len(raw):,}")
 
     # Split به train/val/test
     datasets = {}
     for split_name, split_range in SPLIT_RANGES.items():
-        split_examples = [
-            ex for ex in raw_examples if split_key(ex["question"]) in split_range
-        ]
-
-        # تبدیل به HuggingFace Dataset
-        ds = Dataset.from_list(split_examples)
+        ds = raw.filter(
+            lambda ex: split_key(ex.get("question", "")) in split_range,
+            num_proc=4,
+        )
 
         # Tokenization
         ds = ds.map(
             preprocess_function,
             batched=True,
-            remove_columns=ds.column_names,
+            remove_columns=raw.column_names,
             num_proc=4,
         )
 
-        # فیلتر کردن examples خالی
+        # فیلتر examples خالی
         ds = ds.filter(lambda ex: len(ex.get("input_ids", [])) > 10, num_proc=4)
 
         if split_name == "train":
@@ -397,9 +411,36 @@ def create_curriculum_dataset(min_score: float):
 
 
 # ================================================================
+# 🔥 Custom Data Collator با Weight Support
+# ================================================================
+class WeightedDataCollatorForLanguageModeling(DataCollatorForLanguageModeling):
+    """
+    Data collator که weights رو هم handle می‌کنه
+
+    نحوه کار:
+    1. از هر feature، weight رو جدا می‌کنیم
+    2. باقی کارها رو collator معمولی انجام می‌ده
+    3. weights رو به batch اضافه می‌کنیم
+    """
+
+    def __call__(self, features):
+        # استخراج weights
+        weights = [f.pop("weights", 1.0) for f in features]
+
+        # Collate معمولی
+        batch = super().__call__(features)
+
+        # اضافه کردن weights به batch
+        batch["weights"] = torch.tensor(weights, dtype=torch.float32)
+
+        return batch
+
+
+# ================================================================
 # Training Args
 # ================================================================
 def get_training_args(phase_name: str, num_epochs: int, lr: float):
+    """تنظیمات training برای هر phase"""
     return TrainingArguments(
         output_dir=f"{config.OUTPUT_DIR}/{phase_name}",
         num_train_epochs=num_epochs,
@@ -411,30 +452,38 @@ def get_training_args(phase_name: str, num_epochs: int, lr: float):
         max_grad_norm=config.MAX_GRAD_NORM,
         lr_scheduler_type="cosine",
         warmup_ratio=config.WARMUP_RATIO,
+        # Precision
         bf16=True,
         bf16_full_eval=True,
+        # Logging
         logging_dir=f"{config.OUTPUT_DIR}/logs",
         logging_steps=config.LOGGING_STEPS,
         logging_first_step=True,
+        # Evaluation
         eval_strategy="steps",
         eval_steps=config.EVAL_STEPS,
+        # Checkpointing
         save_strategy="steps",
         save_steps=config.SAVE_STEPS,
         save_total_limit=config.SAVE_TOTAL_LIMIT,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         save_safetensors=True,
+        # Efficiency
         dataloader_num_workers=2,
         dataloader_pin_memory=True,
         gradient_checkpointing=config.USE_QLORA,
         optim="paged_adamw_8bit" if config.USE_QLORA else "adamw_torch",
+        # Reporting
         report_to=["tensorboard"],
         run_name=f"gemma3_{phase_name}",
+        # Resume support
         resume_from_checkpoint=config.RESUME_FROM_CHECKPOINT,
     )
 
 
 def get_last_checkpoint(output_dir: str):
+    """پیدا کردن آخرین checkpoint برای resume"""
     checkpoints = list(Path(output_dir).glob("checkpoint-*"))
     if not checkpoints:
         return None
@@ -447,12 +496,12 @@ def get_last_checkpoint(output_dir: str):
 # ================================================================
 # Training Loop
 # ================================================================
-data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+data_collator = WeightedDataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
 print("\n" + "=" * 70)
-print("🚀 TRAINING START - NEW DATA STRUCTURE")
+print("🚀 TRAINING START - WEIGHTED & BALANCED")
 print(f"   Sample: {config.SAMPLE_RATIO*100:.0f}% | QLoRA: {config.USE_QLORA}")
-print(f"   Use Negatives: {config.USE_NEGATIVE_SAMPLES}")
+print(f"   Use Weights: {config.USE_SAMPLE_WEIGHTS}")
 print("=" * 70)
 
 for i, phase in enumerate(config.CURRICULUM_PHASES, 1):
@@ -465,7 +514,8 @@ for i, phase in enumerate(config.CURRICULUM_PHASES, 1):
 
     checkpoint_callback = SafeCheckpointCallback(config.BACKUP_DIR)
 
-    trainer = Trainer(
+    # 🔥 استفاده از WeightedTrainer
+    trainer = WeightedTrainer(
         model=model,
         args=args,
         train_dataset=datasets["train"],
@@ -519,7 +569,7 @@ print(f"\n💾 Final model: {final_path}")
 
 
 # ================================================================
-# 🔥 Persian Quality Test
+# Persian Quality Test
 # ================================================================
 print("\n" + "=" * 70)
 print("🇮🇷 PERSIAN QUALITY TEST")

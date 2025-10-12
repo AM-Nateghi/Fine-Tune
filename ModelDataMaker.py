@@ -1,18 +1,15 @@
 """
-Data Flattening Script
-======================
+Data Flattening Script - JSONL Input Version
+=============================================
 تبدیل ساختار nested به flat dataset برای SFT و DPO
 
-Input Structure:
-[
-  {
-    "question_id": "...",
-    "positive_responses": [{"text": "...", "score_ratio": 1.0}, ...],
-    "negative_responses": [{"text": "...", "score_ratio": 0.0}, ...],
-    "questions": ["سوال اصلی", "variant 1", ...]
-  },
-  ...
-]
+Input Structure (JSONL - هر خط یک JSON):
+{
+  "question_id": "...",
+  "positive_responses": [{"text": "...", "score_ratio": 1.0}, ...],
+  "negative_responses": [{"text": "...", "score_ratio": 0.0}, ...],
+  "questions": ["سوال اصلی", "variant 1", ...]
+}
 
 Output:
 - sft_dataset.jsonl: برای Supervised Fine-Tuning
@@ -32,7 +29,7 @@ import numpy as np
 # Configuration
 # ================================================================
 class Config:
-    INPUT_FILE = "assets/merged_dataset.jsonl"
+    INPUT_FILE = "assets/merged_dataset.jsonl"  # 🔥 حالا JSONL
     OUTPUT_DIR = "assets/flattened"
 
     # SFT Settings
@@ -47,7 +44,7 @@ class Config:
 
     # Balancing
     ENABLE_BALANCING = True
-    MAX_SAMPLES_PER_QUESTION = 1000  # برای جلوگیری از غلبه سوالات پرپاسخ
+    MAX_SAMPLES_PER_QUESTION = 1000  # برای جلوگیری از غلبه سوالات پرپاسخ ولی خب تعداد سوالات خیلی بیشتر از این عدده
     MIN_SAMPLES_PER_QUESTION = 5  # حداقل برای DPO pairing
 
     # Quality Control
@@ -105,6 +102,33 @@ def is_valid_text(text: str) -> bool:
         return False
 
     return True
+
+
+# ================================================================
+# Load JSONL Data
+# ================================================================
+def load_jsonl_data() -> List[Dict]:
+    """
+    خواندن فایل JSONL (هر خط یک JSON object)
+    """
+    print(f"\n📂 Loading data from: {config.INPUT_FILE}")
+
+    data = []
+    with open(config.INPUT_FILE, "r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                item = json.loads(line)
+                data.append(item)
+            except json.JSONDecodeError as e:
+                print(f"   ⚠️  Warning: Invalid JSON at line {line_num}: {e}")
+                continue
+
+    print(f"   ✅ Loaded {len(data)} questions")
+    return data
 
 
 # ================================================================
@@ -221,6 +245,12 @@ def generate_dpo_dataset(data: List[Dict]) -> List[Dict]:
     """
     تولید dataset برای DPO
     Format: {"question": "...", "chosen": "...", "rejected": "...", "weight": 0.5}
+
+    skipped دیکشنری: ذخیره تعداد samples که skip شدن به دلایل مختلف:
+    - no_positives: سوالاتی که پاسخ مثبت معتبر ندارن
+    - no_negatives: سوالاتی که پاسخ منفی معتبر ندارن
+    - invalid_text: پاسخ‌هایی که validation رو pass نکردن
+    - insufficient_samples: سوالاتی که کمتر از MIN_SAMPLES_PER_QUESTION pair دارن
     """
     print("\n" + "=" * 70)
     print("🔀 GENERATING DPO DATASET")
@@ -228,11 +258,13 @@ def generate_dpo_dataset(data: List[Dict]) -> List[Dict]:
 
     dpo_samples = []
     question_pair_counts = Counter()
+
+    # 🔥 این دیکشنری تعداد samples که به دلایل مختلف skip شدن رو نگه میداره
     skipped = {
-        "no_positives": 0,
-        "no_negatives": 0,
-        "invalid_text": 0,
-        "insufficient_samples": 0,
+        "no_positives": 0,  # سوالاتی که پاسخ مثبت معتبر ندارن
+        "no_negatives": 0,  # سوالاتی که پاسخ منفی معتبر ندارن
+        "invalid_text": 0,  # پاسخ‌هایی که خیلی کوتاه/بلند یا نامعتبر بودن
+        "insufficient_samples": 0,  # سوالاتی که بعد از pairing کمتر از حد مجاز pair داشتن
     }
 
     for item_idx, item in enumerate(data):
@@ -242,7 +274,8 @@ def generate_dpo_dataset(data: List[Dict]) -> List[Dict]:
 
         question_id = item.get("question_id", f"q_{item_idx}")
 
-        # فیلتر کردن پاسخ‌های مثبت
+        # فیلتر کردن پاسخ‌های مثبت (chosen)
+        # باید score بالا داشته باشن و متن معتبر باشه
         positive_responses = [
             r
             for r in item.get("positive_responses", [])
@@ -250,7 +283,8 @@ def generate_dpo_dataset(data: List[Dict]) -> List[Dict]:
             and is_valid_text(normalize_text(r.get("text", "")))
         ]
 
-        # فیلتر کردن پاسخ‌های منفی
+        # فیلتر کردن پاسخ‌های منفی (rejected)
+        # باید score پایین داشته باشن و متن معتبر باشه
         negative_responses = [
             r
             for r in item.get("negative_responses", [])
@@ -258,27 +292,31 @@ def generate_dpo_dataset(data: List[Dict]) -> List[Dict]:
             and is_valid_text(normalize_text(r.get("text", "")))
         ]
 
+        # اگه پاسخ مثبت نداریم، این سوال رو skip می‌کنیم
         if not positive_responses:
             skipped["no_positives"] += 1
             continue
 
+        # اگه پاسخ منفی نداریم، این سوال رو skip می‌کنیم
         if not negative_responses:
             skipped["no_negatives"] += 1
             continue
 
-        # Pairing Strategy
+        # Pairing: ساخت جفت‌های (مثبت، منفی)
         pairs = create_pairs(
             positive_responses, negative_responses, config.DPO_PAIRING_STRATEGY
         )
 
-        # محدود کردن تعداد pairs
+        # محدود کردن تعداد pairs (برای بالانس)
         if len(pairs) > config.MAX_SAMPLES_PER_QUESTION:
             pairs = random.sample(pairs, config.MAX_SAMPLES_PER_QUESTION)
 
+        # اگه خیلی کم pair داریم، این سوال رو skip می‌کنیم
         if len(pairs) < config.MIN_SAMPLES_PER_QUESTION:
             skipped["insufficient_samples"] += 1
             continue
 
+        # ساخت samples نهایی
         for pos_resp, neg_resp in pairs:
             question_text = normalize_text(random.choice(question_variants))
             chosen_text = normalize_text(pos_resp.get("text", ""))
@@ -433,19 +471,15 @@ def calculate_statistics(sft_samples: List[Dict], dpo_samples: List[Dict]) -> Di
 # ================================================================
 def main():
     print("\n" + "=" * 70)
-    print("🚀 DATA FLATTENING SCRIPT")
+    print("🚀 DATA FLATTENING SCRIPT - JSONL VERSION")
     print("=" * 70)
 
     # ایجاد output directory
     output_dir = Path(config.OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # خواندن دیتا
-    print(f"\n📂 Loading data from: {config.INPUT_FILE}")
-    with open(config.INPUT_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    print(f"   Loaded {len(data)} questions")
+    # 🔥 خواندن دیتای JSONL
+    data = load_jsonl_data()
 
     # تولید SFT dataset
     sft_samples = generate_sft_dataset(data)
