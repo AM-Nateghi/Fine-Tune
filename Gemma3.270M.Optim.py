@@ -30,18 +30,19 @@ class Config:
 
     # 🔥 DATA - فایل flatten شده
     SFT_DATA_FILE = "assets/flattened/sft_dataset.jsonl"
+    DPO_DATA_FILE = "assets/flattened/dpo_dataset.jsonl"
     MAX_LENGTH = 512
 
     # 🔥 Sampling
-    SAMPLE_RATIO = 0.01  # برای تست - 1% دیتا
+    SAMPLE_RATIO = 0.025  # برای تست - 2.5% دیتا
     # برای production: 1.0
 
     # 🔥 Weighted Training
     USE_SAMPLE_WEIGHTS = True  # استفاده از weight های محاسبه شده
 
     # QLoRA
-    LORA_R = 64
-    LORA_ALPHA = 128
+    LORA_R = 256
+    LORA_ALPHA = 512
     LORA_DROPOUT = 0.03
     LORA_TARGET_MODULES = [
         "q_proj",
@@ -51,7 +52,7 @@ class Config:
         "gate_proj",
         "up_proj",
         "down_proj",
-        "embed_tokens",
+        # "embed_tokens",
     ]
 
     # Quantization
@@ -162,7 +163,7 @@ class WeightedTrainer(Trainer):
     مثلا: سوالاتی که کمتر پاسخ دارن، وزن بیشتری می‌گیرن
     """
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """
         Override loss برای اعمال weights
 
@@ -234,7 +235,7 @@ def setup_model_and_tokenizer():
         device_map="auto",
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation="eager",
     )
 
     if config.USE_QLORA:
@@ -248,7 +249,7 @@ def setup_model_and_tokenizer():
             target_modules=config.LORA_TARGET_MODULES,
             bias="none",
             inference_mode=False,
-            modules_to_save=["lm_head"],
+            # modules_to_save=["lm_head"],
         )
 
         model = get_peft_model(model, lora_config)
@@ -261,6 +262,28 @@ def setup_model_and_tokenizer():
 
 
 model, tokenizer = setup_model_and_tokenizer()
+
+
+# ================================================================
+# 🔥 EOS Token Verification
+# ================================================================
+print("\n" + "=" * 70)
+print("🔍 EOS TOKEN VERIFICATION")
+print("=" * 70)
+print(f"   Tokenizer: {config.MODEL_NAME}")
+print(f"   EOS token: '{tokenizer.eos_token}'")
+print(f"   EOS token ID: {tokenizer.eos_token_id}")
+print(f"   PAD token: '{tokenizer.pad_token}'")
+print(f"   PAD token ID: {tokenizer.pad_token_id}")
+
+# تست کردن tokenization
+test_text = f"سوال: تست\nپاسخ: جواب{tokenizer.eos_token}"
+test_tokens = tokenizer.encode(test_text)
+print(f"\n   Test tokenization:")
+print(f"   Text: {test_text[:50]}...")
+print(f"   Tokens: {test_tokens[-5:]}")  # آخرین 5 token
+print(f"   Last token is EOS? {test_tokens[-1] == tokenizer.eos_token_id}")
+print("=" * 70)
 
 
 # ================================================================
@@ -309,6 +332,8 @@ def preprocess_function(examples: Dict[str, list]):
     }
 
     Output: tokenized text + weights
+
+    🔥 مهم: EOS token اضافه می‌شه تا مدل یاد بگیره کی باید ساکت شه!
     """
     texts = []
     weights = []
@@ -327,7 +352,9 @@ def preprocess_function(examples: Dict[str, list]):
         q_norm = normalize_text(q)
         r_norm = normalize_text(r)
 
-        text = f"سوال: {q_norm}\nپاسخ: {r_norm}"
+        # 🔥 اضافه کردن EOS token در آخر پاسخ
+        # این به مدل یاد میده که پاسخ کجا تموم میشه
+        text = f"سوال: {q_norm}\nپاسخ: {r_norm}{tokenizer.eos_token}"
         texts.append(text)
         weights.append(float(weight))
 
@@ -336,6 +363,8 @@ def preprocess_function(examples: Dict[str, list]):
         truncation=True,
         max_length=config.MAX_LENGTH,
         padding=False,
+        # 🔥 مهم: add_special_tokens=True باشه تا EOS token رو tokenize کنه
+        add_special_tokens=True,
     )
 
     # اضافه کردن weights به output
@@ -577,10 +606,9 @@ print("=" * 70)
 
 model.eval()
 test_cases = [
+    "چطور میتوان به وجود خدا پی برد؟",
+    "چطوری میشه اثبات کرد که خواب های ما واقعی است؟",
     "معنی زندگی چیست؟",
-    "چرا آسمان آبی است؟",
-    "چگونه می‌توانم خوشبخت باشم؟",
-    "تفاوت عشق و علاقه چیست؟",
 ]
 
 for q in test_cases:
@@ -595,6 +623,8 @@ for q in test_cases:
             top_p=0.9,
             do_sample=True,
             pad_token_id=tokenizer.pad_token_id,
+            # 🔥 مهم: اضافه کردن eos_token_id
+            eos_token_id=tokenizer.eos_token_id,
             repetition_penalty=1.5,
         )
 
@@ -602,6 +632,18 @@ for q in test_cases:
     answer = response.split("پاسخ:")[-1].strip()
     print(f"\n❓ {q}")
     print(f"💬 {answer[:200]}...")
+
+    # 🔥 اضافه: چک کردن اینکه آیا EOS token تولید شد
+    generated_tokens = outputs[0][inputs["input_ids"].shape[1] :]
+    if tokenizer.eos_token_id in generated_tokens:
+        eos_position = (
+            (generated_tokens == tokenizer.eos_token_id)
+            .nonzero(as_tuple=True)[0][0]
+            .item()
+        )
+        print(f"   ✅ EOS generated at position {eos_position}/{len(generated_tokens)}")
+    else:
+        print(f"   ⚠️  No EOS token (reached max_new_tokens)")
 
 print("\n" + "=" * 70)
 print("✅ TRAINING COMPLETE!")
